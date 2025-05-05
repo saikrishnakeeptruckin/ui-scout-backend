@@ -1,7 +1,8 @@
 # app.py (Updated for Image Comparison)
 
 # At the top of app.py
-from flask import Flask, request, jsonify, url_for, send_from_directory # Added url_for, send_from_directory
+import re
+from flask import Flask, json, request, jsonify, url_for, send_from_directory # Added url_for, send_from_directory
 from flask_cors import CORS
 import os
 from werkzeug.utils import secure_filename
@@ -298,7 +299,6 @@ def analyze_and_compare():
                     "Image 1:", input_pil_image,
                     "Image 2:", candidate_pil_image
                 ]
-                # generation_config = genai.types.GenerationConfig(max_output_tokens=64, temperature=0.1) # Low temp, short output for score
                 generation_config = genai.types.GenerationConfig(max_output_tokens=512, temperature=0.3)
 
                 response = multimodal_model.generate_content(scoring_prompt, generation_config=generation_config, stream=False)
@@ -306,7 +306,7 @@ def analyze_and_compare():
                 if response.parts:
                     score = parse_score_from_initial_comparison(response.text)
                     candidate_scores.append({'filename': candidate_filename, 'score': score})
-                    logging.debug(f"Scored {candidate_filename}: {score}")
+                    logging.debug(f"Scored {candidate_filename}: {score} (Raw: {response.text[:50]})") # Log raw text for debugging
                 else:
                     logging.warning(f"No response parts for scoring {candidate_filename}")
 
