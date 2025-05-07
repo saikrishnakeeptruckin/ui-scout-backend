@@ -1,8 +1,5 @@
-# app.py (Updated for Image Comparison)
-
-# At the top of app.py
 import re
-from flask import Flask, json, request, jsonify, url_for, send_from_directory # Added url_for, send_from_directory
+from flask import Flask, json, request, jsonify, url_for, send_from_directory
 from flask_cors import CORS
 import os
 from werkzeug.utils import secure_filename
@@ -10,10 +7,20 @@ import google.generativeai as genai
 from PIL import Image
 import io
 import logging
-import time # To measure execution time
+import time
 import re, json
 import imagehash
 import numpy as np
+import torch
+import torchvision.transforms as T
+import PIL
+import open_clip
+from typing import Optional
+import uuid
+import shutil
+
+TEMP_UPLOAD_FOLDER = 'temp_uploads'
+os.makedirs(TEMP_UPLOAD_FOLDER, exist_ok=True)
 
 # --- Basic Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,7 +39,7 @@ except OSError as e:
     pass
 
 # --- Google AI / Gemini Configuration ---
-API_KEY_FROM_UPLOAD = None # If using the upload method (discouraged)
+API_KEY_FROM_UPLOAD = None
 multimodal_model = None
 
 def configure_google_ai(api_key):
@@ -45,10 +52,9 @@ def configure_google_ai(api_key):
             return False
         genai.configure(api_key=api_key)
         logging.info("Google AI SDK configured successfully using provided API key.")
-        # multimodal_model = genai.GenerativeModel('gemini-pro-vision')
-                # New line using gemini-1.5-flash:
+
         multimodal_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        logging.info("Model 'gemini-1.5-flash-latest' loaded.") # Update log message too
+        logging.info("Model 'gemini-1.5-flash-latest' loaded.")
         return True
     except Exception as e:
         logging.error(f"Error configuring Google AI SDK or loading model: {e}")
@@ -56,18 +62,27 @@ def configure_google_ai(api_key):
         return False
 
 # --- Initialize Google AI ---
-# Try environment variable first, then fallback to uploaded key (if implemented)
-# api_key = os.environ.get("GOOGLE_API_KEY")
 api_key = 'AIzaSyCq3qIEh3DsDQDs67vn6Xq2zXHv5Z5xrpA' # For testing purposes only;
 if api_key:
     logging.info("Using GOOGLE_API_KEY environment variable.")
     configure_google_ai(api_key)
-elif API_KEY_FROM_UPLOAD: # Check if the global var was set by the (discouraged) upload method
-     logging.info("Using API Key provided via upload.")
-     configure_google_ai(API_KEY_FROM_UPLOAD)
+elif API_KEY_FROM_UPLOAD:
+    logging.info("Using API Key provided via upload.")
+    configure_google_ai(API_KEY_FROM_UPLOAD)
 else:
-     logging.warning("Google AI API Key not found in environment variable or via upload. /analyze endpoint will fail.")
+    logging.warning("Google AI API Key not found in environment variable or via upload. /analyze endpoint will fail.")
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+CLIP_MODEL_NAME = "ViT-L-14-336"
+clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+    CLIP_MODEL_NAME, pretrained="openai"
+)
+clip_tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
+clip_model.to(device).eval()
+logging.info(f"CLIP {CLIP_MODEL_NAME} loaded on {device}")
+
+# Cache embeddings so we don’t recompute on every call
+_clip_cache: dict[str, torch.Tensor] = {}
 
 # --- Helper Functions ---
 def allowed_file(filename, allowed_set=ALLOWED_EXTENSIONS):
@@ -109,12 +124,14 @@ def calculate_image_hash(image_path, hash_size=8):
 # --- Flask Routes ---
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    """Endpoint for uploading images (reference dataset or query image)."""
-    # (Code remains the same as previous version)
+    """Endpoint for uploading images with descriptions."""
     if 'image' not in request.files:
         logging.warning("Upload request missing 'image' part.")
         return jsonify({'error': 'No image part'}), 400
+    
     file = request.files['image']
+    description = request.form.get('description', '')
+    
     if file.filename == '':
         logging.warning("Upload request received with no selected file.")
         return jsonify({'error': 'No selected image'}), 400
@@ -125,6 +142,34 @@ def upload_image():
         try:
             file.save(filepath)
             logging.info(f"Image '{filename}' uploaded successfully to '{filepath}'.")
+            
+            # Store the description in a JSON file
+            if description:
+                image_descriptions_file = os.path.join(app.config['UPLOAD_FOLDER'], 'image_descriptions.json')
+                descriptions = {}
+                
+                # Load existing descriptions if the file exists
+                if os.path.exists(image_descriptions_file):
+                    try:
+                        with open(image_descriptions_file, 'r') as f:
+                            descriptions = json.load(f)
+                    except json.JSONDecodeError:
+                        logging.error(f"Error reading descriptions file: Invalid JSON")
+                        descriptions = {}
+                
+                if filename not in descriptions or not descriptions[filename].strip():
+                    descriptions[filename] = description
+                    with open(image_descriptions_file, 'w') as f:
+                        json.dump(descriptions, f, indent=2)
+                    logging.info(f"Stored description for '{filename}'")
+                else:
+                    logging.info(f"Description for '{filename}' already exists – skipping update.")
+                
+                with open(image_descriptions_file, 'w') as f:
+                    json.dump(descriptions, f, indent=2)
+                
+                logging.info(f"Stored description for '{filename}'")
+            
             return jsonify({'message': 'Image uploaded successfully', 'filename': filename}), 200
         except Exception as e:
             logging.error(f"Error saving uploaded file '{filename}': {e}")
@@ -143,7 +188,7 @@ def analyze_and_compare_old():
     """
     start_time = time.time()
     if not multimodal_model:
-         return jsonify({'error': 'Gemini model not available. Check API key configuration and backend logs.'}), 500
+        return jsonify({'error': 'Gemini model not available. Check API key configuration and backend logs.'}), 500
 
     data = request.get_json()
     if not data or 'filename' not in data or 'prompt' not in data:
@@ -156,8 +201,8 @@ def analyze_and_compare_old():
     logging.info(f"Received comparison request for image '{input_filename}' against others in '{UPLOAD_FOLDER}'. Prompt: '{user_prompt}'")
 
     if not os.path.exists(input_image_path):
-         logging.error(f"Input image file not found for comparison: {input_image_path}")
-         return jsonify({'error': f'Input image file not found: {input_filename}'}), 404
+        logging.error(f"Input image file not found for comparison: {input_image_path}")
+        return jsonify({'error': f'Input image file not found: {input_filename}'}), 404
 
     input_pil_image = load_pil_image(input_image_path)
     if not input_pil_image:
@@ -175,7 +220,7 @@ def analyze_and_compare_old():
         logging.info(f"Found {len(candidate_filenames)} candidate images for comparison.")
 
         if not candidate_filenames:
-             return jsonify({'message': 'No other images found in the uploads folder to compare against.'}), 200
+            return jsonify({'message': 'No other images found in the uploads folder to compare against.'}), 200
 
         # --- Iterate and Compare using Gemini ---
         for candidate_filename in candidate_filenames:
@@ -192,15 +237,11 @@ def analyze_and_compare_old():
 
             # --- Gemini API Call for Comparison ---
             try:
-                # **CRITICAL PROMPT ENGINEERING**: Ask Gemini to compare the two images based on the user prompt.
-                # This prompt needs refinement to get useful, consistent results.
                 comparison_prompt_text = (
                     f"Compare the two provided UI screenshots (Image 1 and Image 2) based on the following user focus: '{user_prompt}'. "
                     f"Describe the key similarities and differences relevant to the user's focus. "
                     f"How visually similar are the relevant components mentioned in the user focus? "
                     f"OutPut a summary of the comparison be two separate keys 'comparison_summary' and 'similarity_score'. "
-                    # Example: Ask for a score (might hallucinate or be inconsistent)
-                    # f"On a scale of 1 (very different) to 10 (identical), rate their similarity regarding '{user_prompt}'."
                 )
                 comparison_payload = [
                     comparison_prompt_text,
@@ -209,7 +250,6 @@ def analyze_and_compare_old():
                 ]
 
                 logging.info(f"Sending comparison request to Gemini: '{input_filename}' vs '{candidate_filename}'")
-                # Use same generation config as before, potentially shorter max_output_tokens for comparison?
                 generation_config = genai.types.GenerationConfig(max_output_tokens=512, temperature=0.3)
 
                 response = multimodal_model.generate_content(
@@ -224,8 +264,6 @@ def analyze_and_compare_old():
                     comparison_results.append({
                         'candidate_image': candidate_filename,
                         'comparison_summary': result_text,
-                        # TODO: Add parsing logic here if the prompt asks for a score, e.g., extract the score
-                        # 'similarity_score': parse_score(result_text)
                     })
                 else:
                     block_reason = response.prompt_feedback.block_reason if response.prompt_feedback else "Unknown"
@@ -236,21 +274,14 @@ def analyze_and_compare_old():
                     })
 
             except Exception as api_err:
-                 logging.error(f"Error calling Gemini API for comparison with {candidate_filename}: {api_err}", exc_info=True)
-                 comparison_results.append({
+                logging.error(f"Error calling Gemini API for comparison with {candidate_filename}: {api_err}", exc_info=True)
+                comparison_results.append({
                     'candidate_image': candidate_filename,
                     'error': f"API call failed: {str(api_err)}"
-                 })
+                })
             finally:
-                # Explicitly close images if needed, though PIL's context manager usually handles this
                 if candidate_pil_image:
                     candidate_pil_image.close()
-
-        # --- Process Results ---
-        # For MVP, just return all comparison summaries.
-        # Future: Analyze 'comparison_results' to find the 'best' match based on scores or keywords.
-        # Example: Find entry with highest 'similarity_score' or matching keywords.
-        # best_match = max(comparison_results, key=lambda x: x.get('similarity_score', 0)) if comparison_results else None
 
         end_time = time.time()
         duration = end_time - start_time
@@ -260,7 +291,6 @@ def analyze_and_compare_old():
             'input_image': input_filename,
             'prompt': user_prompt,
             'comparisons': comparison_results,
-            # 'best_match': best_match, # Add later after implementing ranking
             'analysis_duration_seconds': round(duration, 2)
         }), 200
 
@@ -268,8 +298,8 @@ def analyze_and_compare_old():
         logging.error(f"Unexpected error during comparison process: {e}", exc_info=True)
         return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
     finally:
-         if input_pil_image:
-             input_pil_image.close()
+        if input_pil_image:
+            input_pil_image.close()
 
 @app.route('/analyze', methods=['POST'])
 def analyze_and_compare():
@@ -377,13 +407,13 @@ def analyze_and_compare():
                     logging.warning(f"No response parts for scoring {candidate_filename}")
 
             except Exception as api_err:
-                 logging.error(f"Error during scoring for {candidate_filename}: {api_err}")
+                logging.error(f"Error during scoring for {candidate_filename}: {api_err}")
             finally:
-                 if candidate_pil_image: candidate_pil_image.close()
+                if candidate_pil_image: candidate_pil_image.close()
 
         # --- Find Best Candidate ---
         if not candidate_scores:
-             return jsonify({'message': 'Could not score any candidate images.'}), 404
+            return jsonify({'message': 'Could not score any candidate images.'}), 404
         best_candidate = max(candidate_scores, key=lambda x: x['score'])
         logging.info(f"Best initial candidate: {best_candidate['filename']} with score {best_candidate['score']}")
 
@@ -415,8 +445,8 @@ def analyze_and_compare():
                 parsed_details = {'summary': 'Failed to get detailed comparison.', 'similarities': '', 'differences': ''}
 
         except Exception as detail_err:
-             logging.error(f"Error during detailed comparison for {best_candidate_filename}: {detail_err}")
-             parsed_details = {'summary': f'Error getting details: {str(detail_err)}', 'similarities': '', 'differences': ''}
+            logging.error(f"Error during detailed comparison for {best_candidate_filename}: {detail_err}")
+            parsed_details = {'summary': f'Error getting details: {str(detail_err)}', 'similarities': '', 'differences': ''}
         finally:
             if best_candidate_pil_image: best_candidate_pil_image.close()
 
@@ -450,7 +480,7 @@ def analyze_and_compare():
         logging.error(f"Unexpected error in /analyze: {e}", exc_info=True)
         return jsonify({'error': f'An unexpected server error occurred: {str(e)}'}), 500
     finally:
-         if input_pil_image: input_pil_image.close()
+        if input_pil_image: input_pil_image.close()
 
 @app.route('/list-images', methods=['GET'])
 def list_uploaded_images():
@@ -478,7 +508,6 @@ def list_uploaded_images():
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
-    # Check if file exists to prevent errors (optional but good practice)
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     if not os.path.exists(file_path):
         return jsonify({"error": "File not found"}), 404
@@ -507,8 +536,8 @@ def analyze_with_imagehash():
         logging.warning(f"Text prompt '{user_prompt}' provided but will be IGNORED by ImageHash comparison.")
 
     if not os.path.exists(input_image_path):
-         logging.error(f"Input image file not found for hashing: {input_image_path}")
-         return jsonify({'error': f'Input image file not found: {input_filename}'}), 404
+        logging.error(f"Input image file not found for hashing: {input_image_path}")
+        return jsonify({'error': f'Input image file not found: {input_filename}'}), 404
 
     # Calculate hash for the input image
     input_hash = calculate_image_hash(input_image_path)
@@ -525,7 +554,7 @@ def analyze_with_imagehash():
         logging.info(f"Found {len(candidate_filenames)} candidate images for ImageHash comparison.")
 
         if not candidate_filenames:
-             return jsonify({'message': 'No other images found in the uploads folder to compare against.'}), 200
+            return jsonify({'message': 'No other images found in the uploads folder to compare against.'}), 200
 
         # --- Iterate and Compare Hashes ---
         for candidate_filename in candidate_filenames:
@@ -543,13 +572,13 @@ def analyze_with_imagehash():
             # Lower distance = higher similarity
             max_distance = len(str(input_hash)) * 4 # Approximation for hex hash length, more accurately hash_size*hash_size for binary
             if hasattr(input_hash, 'hash_size'): # Check if hash object provides size
-                 max_distance = input_hash.hash_size**2 # For phash/dhash etc.
+                max_distance = input_hash.hash_size**2 # For phash/dhash etc.
             
             # Calculate similarity score (closer to 1 is more similar)
             # Avoid division by zero if max_distance is somehow 0
             similarity_score = 0.0
             if max_distance > 0:
-                 similarity_score = max(0.0, 1.0 - (distance / max_distance))
+                similarity_score = max(0.0, 1.0 - (distance / max_distance))
 
 
             logging.debug(f"ImageHash Compare: '{input_filename}' vs '{candidate_filename}', Distance: {distance}, Score: {similarity_score:.4f}")
@@ -561,7 +590,7 @@ def analyze_with_imagehash():
 
         # --- Find Best Match (Lowest Hamming Distance) ---
         if not comparison_results:
-             return jsonify({'message': 'Could not hash any candidate images.'}), 404
+            return jsonify({'message': 'Could not hash any candidate images.'}), 404
 
         # Sort by distance (ascending) to find the best match
         comparison_results.sort(key=lambda x: x['hamming_distance'])
@@ -598,7 +627,6 @@ def analyze_with_imagehash():
     except Exception as e:
         logging.error(f"Unexpected error during ImageHash comparison process: {e}", exc_info=True)
         return jsonify({'error': f'An unexpected error occurred during hash comparison: {str(e)}'}), 500
-
 
 @app.route('/analyze-combined', methods=['POST'])
 def analyze_and_compare_combined():
@@ -639,15 +667,9 @@ def analyze_and_compare_combined():
             # return jsonify({'error': f'Could not calculate hash for input image: {input_filename}'}), 500
 
     except Exception as load_err:
-         logging.error(f"Error loading input image or its hash: {load_err}")
-         if input_pil_image: input_pil_image.close()
-         return jsonify({'error': f'Could not load input image or calculate its hash: {input_filename}'}), 500
-
-
-    # --- Check for Exact Hash Match (Optimization) ---
-    # (Keep your existing MD5 hash check for identical files if desired)
-    # ... (Your hashlib code here) ...
-
+        logging.error(f"Error loading input image or its hash: {load_err}")
+        if input_pil_image: input_pil_image.close()
+        return jsonify({'error': f'Could not load input image or calculate its hash: {input_filename}'}), 500
 
     # --- Pass 1: Get Scores (Gemini & ImageHash) for all Candidates ---
     candidate_scores = []
@@ -689,7 +711,7 @@ def analyze_and_compare_combined():
                             hash_score = max(0.0, 1.0 - (distance / max_distance))
                         logging.debug(f"ImageHash Score for {candidate_filename}: {hash_score:.4f} (Dist: {distance})")
                     else:
-                         logging.warning(f"Could not calculate hash for candidate {candidate_filename}")
+                        logging.warning(f"Could not calculate hash for candidate {candidate_filename}")
                 else:
                     logging.debug(f"Skipping ImageHash for {candidate_filename} as input hash failed.")
 
@@ -736,19 +758,19 @@ def analyze_and_compare_combined():
                 })
 
             except Exception as api_err:
-                 logging.error(f"Error during hybrid scoring for {candidate_filename}: {api_err}", exc_info=True)
-                 # Optionally add placeholder score or skip
-                 candidate_scores.append({ # Add with low scores on error
+                logging.error(f"Error during hybrid scoring for {candidate_filename}: {api_err}", exc_info=True)
+                # Optionally add placeholder score or skip
+                candidate_scores.append({ # Add with low scores on error
                     'filename': candidate_filename, 'gemini_score': 0.0, 'hash_score': 0.0, 'hamming_distance': -1, 'combined_score': 0.0
-                 })
+                })
             finally:
-                 if candidate_pil_image: candidate_pil_image.close()
+                if candidate_pil_image: candidate_pil_image.close()
 
         # --- Find Best Candidate based on COMBINED score ---
         if not candidate_scores:
-             # This case should ideally be handled earlier if candidate_filenames is empty
-             return jsonify({'message': 'Could not score any candidate images.'}), 404 
-             
+            # This case should ideally be handled earlier if candidate_filenames is empty
+            return jsonify({'message': 'Could not score any candidate images.'}), 404 
+
         # Sort descending by combined_score
         candidate_scores.sort(key=lambda x: x['combined_score'], reverse=True) 
         best_candidate = candidate_scores[0]
@@ -795,8 +817,8 @@ def analyze_and_compare_combined():
                     parsed_details['summary'] = f"AI could not generate detailed comparison (Reason: {block_reason}). The overall combined similarity score was {final_reported_score:.2f}."
                     
         except Exception as detail_err:
-             logging.error(f"Error during detailed comparison for {best_candidate_filename}: {detail_err}", exc_info=True)
-             parsed_details['summary'] = f'Error getting details: {str(detail_err)}'
+            logging.error(f"Error during detailed comparison for {best_candidate_filename}: {detail_err}", exc_info=True)
+            parsed_details['summary'] = f'Error getting details: {str(detail_err)}'
         finally:
             if best_candidate_pil_image: best_candidate_pil_image.close()
 
@@ -805,11 +827,11 @@ def analyze_and_compare_combined():
             image_url = url_for('uploaded_file', filename=best_candidate_filename, _external=True)
         except Exception as url_err:
             logging.error(f"Could not generate URL for {best_candidate_filename}: {url_err}")
-            image_url = f"/uploads/{best_candidate_filename}" # Fallback
+            image_url = f"/uploads/{best_candidate_filename}"
 
         final_result = {
             'name': best_candidate_filename,
-            'score': round(final_reported_score, 4), # Report the combined score
+            'score': round(final_reported_score, 4),
             'imageUrl': image_url,
             'summary': parsed_details.get('summary', 'Summary not available.'),
             'similarities': parsed_details.get('similarities', 'Similarities not available.'),
@@ -817,13 +839,12 @@ def analyze_and_compare_combined():
             'input_image': input_filename,
             'prompt': user_prompt,
             'analysis_duration_seconds': round(time.time() - start_time, 2),
-            'is_exact_match': False, # Assuming MD5 check runs earlier
-             # Add score details for debugging/transparency (optional for frontend)
+            'is_exact_match': False,
             'score_details': {
-                 'combined': round(best_candidate['combined_score'], 4),
-                 'gemini': round(best_candidate['gemini_score'], 4),
-                 'imagehash': round(best_candidate['hash_score'], 4),
-                 'hamming_distance': best_candidate['hamming_distance']
+                'combined': round(best_candidate['combined_score'], 4),
+                'gemini': round(best_candidate['gemini_score'], 4),
+                'imagehash': round(best_candidate['hash_score'], 4),
+                'hamming_distance': best_candidate['hamming_distance']
             },
             'analysis_method': 'Hybrid (Gemini + ImageHash)'
         }
@@ -834,7 +855,7 @@ def analyze_and_compare_combined():
         logging.error(f"Unexpected error in /analyze (hybrid): {e}", exc_info=True)
         return jsonify({'error': f'An unexpected server error occurred: {str(e)}'}), 500
     finally:
-         if input_pil_image: input_pil_image.close()
+        if input_pil_image: input_pil_image.close()
 
 def parse_detailed_comparison_json(text):
     """Parses summary, similarities, differences from Gemini's JSON response."""
@@ -895,7 +916,7 @@ def parse_score_from_initial_comparison(text):
             if score_val > 1.0 and score_val <= 10.0 and "/" not in match.group(0) and ":" not in match.group(0) and "=" not in match.group(0) :
                 score_val /= 10.0
             elif score_val > 1.0: # Avoid scores > 1 unless normalized from /10
-                 continue # Likely misinterpretation, try next pattern
+                continue # Likely misinterpretation, try next pattern
             logging.info(f"Parsed score via regex pattern '{pattern}': {score_val}")
             return min(max(score_val, 0.0), 1.0) # Clamp score between 0 and 1
 
@@ -942,13 +963,360 @@ def parse_detailed_comparison(text):
 
     return details
 
-# Add the /set-api-key endpoint here if you are using that (discouraged) method
-# @app.route('/set-api-key', ...)
+# ─── Helpers 2 ------------------------------------------------
+def _clip_image_emb(path: str) -> torch.Tensor:
+    if path in _clip_cache:
+        return _clip_cache[path]
+    img = PIL.Image.open(path).convert("RGB")
+    with torch.no_grad():
+        emb = clip_model.encode_image(
+            clip_preprocess(img).unsqueeze(0).to(device)
+        ).squeeze(0).cpu()
+    _clip_cache[path] = emb / emb.norm()  # store unit‑norm
+    return _clip_cache[path]
+
+_clip_text_cache: dict[str, torch.Tensor] = {}
+def _clip_text_emb(prompt: str) -> torch.Tensor:
+    if prompt in _clip_text_cache:
+        return _clip_text_cache[prompt]
+    with torch.no_grad():
+        tok = clip_tokenizer([prompt]).to(device)
+        emb = clip_model.encode_text(tok).squeeze(0).cpu()
+    _clip_text_cache[prompt] = emb / emb.norm()
+    return _clip_text_cache[prompt]
+
+def clip_find_best(query_path: str, user_prompt: str) -> dict:
+    q_img = _clip_image_emb(query_path)
+    q_desc = get_description_for(os.path.basename(query_path)) or ""
+    q_text_emb = _clip_text_emb(f"{user_prompt}. {q_desc}")
+
+    refs = [
+        f for f in os.listdir(app.config['UPLOAD_FOLDER'])
+        if allowed_file(f) and f != os.path.basename(query_path)
+    ]
+    if not refs:
+        return {}
+
+    scores = []
+    for rf in refs:
+        r_path = os.path.join(app.config['UPLOAD_FOLDER'], rf)
+        # --- image embedding
+        r_img = _clip_image_emb(r_path)
+
+        # --- description embedding
+        r_desc = get_description_for(rf) or ""
+        r_text_emb = _clip_text_emb(r_desc) if r_desc else None
+
+        sim_img  = (q_img  @ r_img ).item()
+        sim_txti = (q_text_emb @ r_img ).item()
+        sim_txtt = (q_text_emb @ r_text_emb ).item() if r_text_emb is not None else 0.0
+
+        score = 0.6*sim_img + 0.3*sim_txti + 0.2*sim_txtt
+        scores.append((score, rf))
+
+    scores.sort(reverse=True)
+    best_score, best_name = scores[0]
+    return {"filename": best_name, "score": round(best_score,4)}
+
+def gemini_detailed_explanation(query_path: str,
+                                candidate_path: str,
+                                user_prompt: str, # User's original prompt
+                                candidate_description: Optional[str]) -> dict:
+    if multimodal_model is None:
+        return {"summary": "", "similarities": "", "differences": ""}
+
+    gemini_system_prompt = (
+        f"You are comparing two UI screenshots. Image 1 is the user's query. Image 2 is a candidate match. "
+        f"The user's specific focus (original prompt) is: '{user_prompt}'. "
+    )
+
+    if candidate_description:
+        gemini_system_prompt += f"The candidate image (Image 2) has a stored description: '{candidate_description}'. "
+
+    gemini_system_prompt += (
+        "Based on all this information, provide a detailed comparison. "
+        "Respond ONLY with a JSON object containing the keys 'summary', 'similarities', and 'differences'. "
+        "The 'similarities' and 'differences' values should be markdown bullet point lists, focusing on aspects relevant to the user's original prompt and the candidate's description."
+    )
+
+    detail_prompt_payload = [
+        gemini_system_prompt,
+        "Image 1 (User Query):", load_pil_image(query_path),
+        "Image 2 (Candidate Match):", load_pil_image(candidate_path)
+    ]
+
+    cfg = genai.types.GenerationConfig(max_output_tokens=768, temperature=0.3)
+    resp = multimodal_model.generate_content(detail_prompt_payload,
+                                            generation_config=cfg,
+                                            stream=False)
+
+    # ---------- tiny parser ----------
+    import re, json
+    raw = re.sub(r"```json|```", "", resp.text).strip()
+    try:
+        data = json.loads(raw)
+        return {
+            "summary":      data.get("summary", "Summary could not be generated."),
+            "similarities": data.get("similarities", "Similarities could not be generated."),
+            "differences":  data.get("differences", "Differences could not be generated.")
+        }
+    except Exception as e:
+        logging.error(f"Failed to parse Gemini JSON for detailed explanation: {e}. Raw text: {resp.text[:200]}")
+        return {"summary": resp.text if resp.text else "Details could not be extracted.", "similarities": "", "differences": ""}
+
+CLIP_THRESHOLD = 0.25
+
+@app.route('/analyze-clip', methods=['POST'])
+def analyze_clip():
+    start = time.time()
+    data = request.get_json(force=True)
+    fname = secure_filename(data.get("filename", ""))
+    prompt = data.get("prompt", "")
+    q_path = os.path.join(UPLOAD_FOLDER, fname)
+    if not os.path.exists(q_path):
+        return jsonify({"error": "file not found"}), 404
+
+    best = clip_find_best(q_path, prompt)
+    if not best:
+        return jsonify({"message": "No reference images"}), 200
+
+    # If similarity too low → early exit
+    if best["score"] < CLIP_THRESHOLD:
+        return jsonify({"message": "No semantically close match found."}), 200
+
+    best_candidate_description = get_description_for(best["filename"])
+
+    detail = gemini_detailed_explanation(
+        q_path,
+        os.path.join(UPLOAD_FOLDER, best["filename"]),
+        prompt,
+        best_candidate_description
+    )
+
+    response = {
+        "name":      best["filename"],
+        "score":     best["score"],
+        "imageUrl":  url_for("uploaded_file", filename=best["filename"], _external=True),
+        **detail,
+        "description": best_candidate_description,
+        "input_image": fname,
+        "prompt":      prompt,
+        "analysis_method": "CLIP‑RN50 + Gemini",
+        "analysis_duration_seconds": round(time.time() - start, 2)
+    }
+
+    return jsonify(response), 200
+
+@app.route('/image-descriptions', methods=['GET'])
+def get_image_descriptions():
+    """Endpoint to get image descriptions from the JSON file."""
+    image_descriptions_file = os.path.join(app.config['UPLOAD_FOLDER'], 'image_descriptions.json')
+    
+    if not os.path.exists(image_descriptions_file):
+        return jsonify({"descriptions": {}}), 200
+    
+    try:
+        with open(image_descriptions_file, 'r') as f:
+            descriptions = json.load(f)
+        return jsonify({"descriptions": descriptions}), 200
+    except Exception as e:
+        logging.error(f"Error reading image descriptions file: {e}")
+        return jsonify({"error": f"Could not read image descriptions: {str(e)}"}), 500
+
+def get_description_for(filename: str) -> Optional[str]:
+    """Returns the saved description (or None) for an image file."""
+    try:
+        desc_path = os.path.join(app.config['UPLOAD_FOLDER'], "image_descriptions.json")
+        if not os.path.exists(desc_path):
+            return None
+        with open(desc_path, "r") as fp:
+            data = json.load(fp)
+        return data.get(filename)
+    except Exception as exc:
+        logging.error(f"Could not read description for {filename}: {exc}")
+        return None
+
+# --------------------- FINAL FLOW CURRENTLY IMPLEMENTED ---------------------
+
+# Testing Reverse Flow - For Testing only
+@app.route('/analyze-temp', methods=['POST'])
+def analyze_temp_image():
+    """
+    Analyzes a temporary uploaded image without adding it to the permanent database.
+    """
+    start_time = time.time()
+    
+    if 'image' not in request.files:
+        logging.warning("Temp upload request missing 'image' part.")
+        return jsonify({'error': 'No image part'}), 400
+    
+    file = request.files['image']
+    prompt = request.form.get('prompt', '')
+    
+    if file.filename == '':
+        logging.warning("Temp upload request received with no selected file.")
+        return jsonify({'error': 'No selected image'}), 400
+
+    if file and allowed_file(file.filename):
+        # Generate a unique temporary filename
+        temp_id = str(uuid.uuid4())
+        orig_filename = secure_filename(file.filename)
+        # Keep original extension
+        ext = os.path.splitext(orig_filename)[1]
+        temp_filename = f"temp_{temp_id}{ext}"
+        temp_filepath = os.path.join(TEMP_UPLOAD_FOLDER, temp_filename)
+        
+        try:
+            # Save to temp location
+            file.save(temp_filepath)
+            logging.info(f"Temporary image '{temp_filename}' saved to '{temp_filepath}' for analysis.")
+            
+            # Run analysis using the temp file
+            # We can use the same logic as analyze-clip but with our temp file
+            
+            # This part would need to be adapted from your existing analysis logic
+            # For now, let's simulate calling clip_find_best but with temp path
+            best = clip_find_best(temp_filepath, prompt)
+            
+            if not best:
+                return jsonify({
+                    "message": "No reference images found",
+                    "temp_filename": temp_filename
+                }), 200
+
+            # If similarity too low → inform the user
+            if best.get("score", 0) < CLIP_THRESHOLD:
+                return jsonify({
+                    "message": "No semantically close match found.",
+                    "temp_filename": temp_filename
+                }), 200
+
+            best_candidate_description = get_description_for(best["filename"])
+
+            detail = gemini_detailed_explanation(
+                temp_filepath,
+                os.path.join(UPLOAD_FOLDER, best["filename"]),
+                prompt,
+                best_candidate_description
+            )
+
+            response = {
+                "name": best["filename"],
+                "score": best["score"],
+                "imageUrl": url_for("uploaded_file", filename=best["filename"], _external=True),
+                **detail,
+                "description": best_candidate_description,
+                "input_image": os.path.basename(temp_filepath),
+                "prompt": prompt,
+                "analysis_method": "CLIP‑RN50 + Gemini",
+                "analysis_duration_seconds": round(time.time() - start_time, 2),
+                "temp_filename": temp_filename  # Include the temp filename for later use
+            }
+
+            return jsonify(response), 200
+            
+        except Exception as e:
+            logging.error(f"Error analyzing temporary file '{temp_filename}': {e}", exc_info=True)
+            return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+    else:
+        logging.warning(f"Temp upload attempt with invalid file type: {file.filename}")
+        return jsonify({'error': 'Invalid file type. Allowed types: png, jpg, jpeg'}), 400
+
+@app.route('/upload-analyzed', methods=['POST'])
+def upload_image_analyzed():
+    """Endpoint for uploading images with descriptions."""
+    if 'image' not in request.files:
+        logging.warning("Upload request missing 'image' part.")
+        return jsonify({'error': 'No image part'}), 400
+    
+    file = request.files['image']
+    description = request.form.get('description', '')
+    temp_filename = request.form.get('temp_filename', None)
+    
+    if file.filename == '':
+        logging.warning("Upload request received with no selected file.")
+        return jsonify({'error': 'No selected image'}), 400
+
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        # If we have a temp file, try to use it instead of uploading again
+        if temp_filename:
+            temp_filepath = os.path.join(TEMP_UPLOAD_FOLDER, secure_filename(temp_filename))
+            if os.path.exists(temp_filepath):
+                try:
+                    # Move from temp to permanent location
+                    shutil.copy2(temp_filepath, filepath)
+                    logging.info(f"Moved temporary image '{temp_filename}' to permanent storage as '{filename}'")
+                    
+                    try:
+                        os.remove(temp_filepath)
+                        logging.info(f"Deleted temporary file '{temp_filename}' after successful upload")
+                    except Exception as del_err:
+                        logging.warning(f"Failed to delete temporary file '{temp_filename}': {del_err}")
+                        # Continue even if deletion fails
+                
+                except Exception as move_err:
+                    logging.error(f"Failed to move temp file: {move_err}")
+                    # Fall back to normal upload if move fails
+                    file.save(filepath)
+            else:
+                # Temp file not found, do normal upload
+                file.save(filepath)
+        else:
+            # No temp file, do normal upload
+            file.save(filepath)
+        
+        logging.info(f"Image '{filename}' uploaded successfully to '{filepath}'.")
+        
+        # Store the description in a JSON file
+        if description:
+            image_descriptions_file = os.path.join(app.config['UPLOAD_FOLDER'], 'image_descriptions.json')
+            descriptions = {}
+            
+            # Load existing descriptions if the file exists
+            if os.path.exists(image_descriptions_file):
+                try:
+                    with open(image_descriptions_file, 'r') as f:
+                        descriptions = json.load(f)
+                except json.JSONDecodeError:
+                    logging.error(f"Error reading descriptions file: Invalid JSON")
+                    descriptions = {}
+            
+            descriptions[filename] = description
+            with open(image_descriptions_file, 'w') as f:
+                json.dump(descriptions, f, indent=2)
+            
+            logging.info(f"Stored description for '{filename}'")
+        
+        return jsonify({'message': 'Image uploaded successfully', 'filename': filename}), 200
+    else:
+        logging.warning(f"Upload attempt with invalid file type: {file.filename}")
+        return jsonify({'error': 'Invalid file type. Allowed types: png, jpg, jpeg'}), 400
+
+@app.route('/temp-uploads/<filename>')
+def temp_uploaded_file(filename):
+    """Serve temporarily uploaded files."""
+    return send_from_directory(TEMP_UPLOAD_FOLDER, filename)
+
+@app.route('/temp-delete/<filename>', methods=['DELETE'])
+def delete_temp_image(filename):
+    path = os.path.join(TEMP_UPLOAD_FOLDER, secure_filename(filename))
+    try:
+        os.remove(path)
+        return jsonify({"deleted": filename}), 200
+    except FileNotFoundError:
+        return jsonify({"error": "not found"}), 404
+    except Exception as e:
+        logging.error(f"Failed to delete temp file {filename}: {e}")
+        return jsonify({"error": "internal error"}), 500
+
+# Testing code ends here
 
 if __name__ == '__main__':
-    # Check API key before starting
     if not multimodal_model:
-         logging.error("FATAL: Gemini model not initialized. Check API key setup (environment variable or other method). Cannot start server.")
+        logging.error("FATAL: Gemini model not initialized. Check API key setup (environment variable or other method). Cannot start server.")
     else:
         is_debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
         logging.info(f"Starting Flask server (Debug mode: {is_debug_mode})")
